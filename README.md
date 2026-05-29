@@ -91,7 +91,7 @@ SOLANA_NETWORK=mainnet-beta
 # Server Ubuntu 22.04
 sudo apt update && sudo apt install -y docker.io docker-compose git
 
-https://github.com/aleinsinna33/Arkanis1.git
+git clone https://github.com/aleinsinna33/Arkanis1.git
 cd arkanis
 cp backend/.env.example backend/.env
 # Modifica .env
