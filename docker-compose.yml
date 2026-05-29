@@ -1,0 +1,62 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: arkanis-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: arkanis_db
+      POSTGRES_USER: arkanis_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arkanis_user -d arkanis_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: arkanis-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://arkanis_user:${DB_PASSWORD:-changeme}@db:5432/arkanis_db
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: 4000
+      NODE_ENV: production
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SOLANA_TREASURY_WALLET: ${SOLANA_TREASURY_WALLET}
+      SOLANA_NETWORK: ${SOLANA_NETWORK:-mainnet-beta}
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: arkanis-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    volumes:
+      - ./ssl:/etc/nginx/ssl:ro
+
+volumes:
+  postgres_data:
