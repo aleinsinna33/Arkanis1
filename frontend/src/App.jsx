@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback, useRef } from "react";
 import { CARDS, RARITY_COLOR, DIFFICULTIES, POWERS, SHOP_PACKS, PREMIUM_PACKS, WHEEL_PRIZES } from "./data.js";
 import * as API from "./api.js";
@@ -6,68 +5,25 @@ import QuestsTab from "./QuestsTab.jsx";
 import LevelsTab, { LevelBadge, XpBar, LevelUpOverlay } from "./LevelsTab.jsx";
 
 // ═══════════════════════════════════════════════════════
-// MOCK DATABASE — in produzione sostituisci con API calls
+// TOKEN HELPERS
 // ═══════════════════════════════════════════════════════
-// API endpoints da implementare sul backend:
-// POST /api/auth/register  → { username, email, password } → { user, token }
-// POST /api/auth/login     → { username, password }        → { user, token }
-// GET  /api/cards          → { cards[] }
-// GET  /api/user/cards     → { userCards[] }
-// POST /api/battle/result  → { difficulty, won }           → { eloNew, creditsNew }
-// GET  /api/leaderboard    → { players[] }
-// POST /api/shop/buy       → { itemId, type }              → { success }
-// POST /api/premium/buy    → { packId, txSignature }       → { success, items }
+const TOKEN_KEY = 'arkanis_token';
 
+function saveToken(token) { localStorage.setItem(TOKEN_KEY, token); }
+function getToken()       { return localStorage.getItem(TOKEN_KEY); }
+function removeToken()    { localStorage.removeItem(TOKEN_KEY); }
+
+// DB shim — tutte le operazioni ora vanno al backend reale.
+// updateUser aggiorna solo lo state locale (i dati veri vengono
+// dal backend dopo ogni operazione).
 const DB = {
-  users: JSON.parse(localStorage.getItem('ark_users') || '{}'),
-  currentUser: JSON.parse(localStorage.getItem('ark_current_user') || 'null'),
-  save() {
-    localStorage.setItem('ark_users', JSON.stringify(this.users));
-    localStorage.setItem('ark_current_user', JSON.stringify(this.currentUser));
-  },
-  register(username, email, password) {
-    const key = username.toLowerCase();
-    if (this.users[key]) throw new Error('Username già in uso');
-    const user = {
-      id: Date.now(),
-      username,
-      email,
-      passwordHash: btoa(password),
-      elo: 1000,
-      credits: 100,
-      spins: 1,
-      ownedPowers: [],
-      wins: 0,
-      losses: 0,
-      wallet: null,
-      createdAt: new Date().toISOString(),
-    };
-    this.users[key] = user;
-    this.currentUser = user;
-    this.save();
-    return user;
-  },
-  login(username, password) {
-    const key = username.toLowerCase();
-    const user = this.users[key];
-    if (!user) throw new Error('Utente non trovato');
-    if (user.passwordHash !== btoa(password)) throw new Error('Password errata');
-    this.currentUser = user;
-    this.save();
-    return user;
-  },
   updateUser(updates) {
-    if (!this.currentUser) return;
-    const key = this.currentUser.username.toLowerCase();
-    this.currentUser = { ...this.currentUser, ...updates };
-    this.users[key] = this.currentUser;
-    this.save();
-    return this.currentUser;
-  },
-  getLeaderboard() {
-    return Object.values(this.users).sort((a, b) => b.elo - a.elo);
+    // Usato solo per aggiornare lo state React locale,
+    // non scrive più nel localStorage.
+    return updates;
   },
 };
+
 
 // ═══════════════════════════════════════════════════════
 // CARD DATA
@@ -195,17 +151,20 @@ function AuthScreen({ onLogin }) {
     e.preventDefault();
     setError(""); setLoading(true);
     try {
-      let user;
+      let data;
       if (tab === "login") {
-        user = DB.login(form.username, form.password);
+        data = await API.login({ username: form.username, password: form.password });
       } else {
         if (!form.email.includes("@")) throw new Error("Email non valida");
         if (form.password.length < 6) throw new Error("Password min 6 caratteri");
-        user = DB.register(form.username, form.email, form.password);
+        data = await API.register({ username: form.username, email: form.email, password: form.password });
       }
+      saveToken(data.token);
+      // Normalize owned_powers → ownedPowers
+      const user = { ...data.user, ownedPowers: data.user.owned_powers || [] };
       onLogin(user);
     } catch (err) {
-      setError(err.message);
+      setError(err.response?.data?.error || err.message || "Errore di connessione");
     } finally {
       setLoading(false);
     }
@@ -459,12 +418,18 @@ function BattleTab({ user, onUserUpdate }) {
           {minLevel:100,name:"Immortale",color:"#c9a84c",icon:"💎"},
         ];
         const newRank = [...RANK_LIST].reverse().find(r => newLevel >= r.minLevel) || RANK_LIST[0];
-        const updated = DB.updateUser({
-          credits: newCredits + levelUpBonus,
-          elo: newElo, wins: newWins, spins: newSpins,
-          xp: newXp, level: newLevel
-        });
-        onUserUpdate(updated);
+        // Chiama il backend reale
+        API.saveBattleResult({ difficulty, result: 'win' })
+          .then(data => {
+            const u = { ...user, ...data.user, ownedPowers: user.ownedPowers || [] };
+            u.level = newLevel; u.xp = newXp;
+            onUserUpdate(u);
+          })
+          .catch(() => {
+            // fallback locale se API non raggiungibile
+            onUserUpdate({ ...user, credits: newCredits + levelUpBonus,
+              elo: newElo, wins: newWins, spins: newSpins, xp: newXp, level: newLevel });
+          });
         if (leveledUp) {
           setTimeout(() => setLevelUpData({ oldLevel, newLevel, rank: newRank, bonus: levelUpBonus }), 800);
         }
@@ -488,10 +453,13 @@ function BattleTab({ user, onUserUpdate }) {
       if (newPlayerHP <= 0) {
         setTimeout(() => {
           setGameOver("lose");
-          const newElo = Math.max(0, (user.elo||1000) - 15);
-          const newLosses = (user.losses||0) + 1;
-          const updated = DB.updateUser({ elo:newElo, losses:newLosses });
-          onUserUpdate(updated);
+          API.saveBattleResult({ difficulty, result: 'lose' })
+            .then(data => {
+              onUserUpdate({ ...user, ...data.user, ownedPowers: user.ownedPowers || [] });
+            })
+            .catch(() => {
+              onUserUpdate({ ...user, elo: Math.max(0,(user.elo||1000)-15), losses:(user.losses||0)+1 });
+            });
         }, 400);
         return;
       }
@@ -770,16 +738,22 @@ function RewardsTab({ user, onUserUpdate }) {
     ctx.textAlign='center'; ctx.fillText('Ⱥ',cx,cy+4);
   }
 
-  const claimDaily = () => {
+  const claimDaily = async () => {
     if (dailyClaimed) return;
-    localStorage.setItem('ark_daily', new Date().toDateString());
-    setDailyClaimed(true);
-    const cards = Array(3).fill(null).map(() => CARDS[Math.floor(Math.random()*CARDS.length)]);
-    cards.forEach((c,i) => setTimeout(() => {
-      setRevealedCards(prev => { const n=[...prev]; n[i]=c; return n; });
-    }, i*600+300));
-    const updated = DB.updateUser({ credits:(user.credits||0)+10 });
-    onUserUpdate(updated);
+    try {
+      const data = await API.claimDaily();
+      localStorage.setItem('ark_daily', new Date().toDateString());
+      setDailyClaimed(true);
+      const cards = data.cards || Array(3).fill(null).map(() => CARDS[Math.floor(Math.random()*CARDS.length)]);
+      cards.forEach((c,i) => setTimeout(() => {
+        setRevealedCards(prev => { const n=[...prev]; n[i]=c; return n; });
+      }, i*600+300));
+      onUserUpdate(prev => ({ ...prev, credits: data.credits ?? (prev.credits||0)+10 }));
+    } catch(e) {
+      // fallback se già reclamato
+      localStorage.setItem('ark_daily', new Date().toDateString());
+      setDailyClaimed(true);
+    }
   };
 
   const spinWheel = () => {
@@ -798,17 +772,25 @@ function RewardsTab({ user, onUserUpdate }) {
       setWheelRot(ease*deg);
       if (t < 1) requestAnimationFrame(animate);
       else {
-        setSpinning(false);
-        const prize = WHEEL_PRIZES[pi];
-        let msg = "";
-        let updates = { spins:(user.spins||0)-1 };
-        if (prize.type==="credits") { updates.credits=(user.credits||0)+prize.val; msg=`🎉 Hai vinto ${prize.val} crediti!`; }
-        else if (prize.type==="card") { const c=CARDS[Math.floor(Math.random()*CARDS.length)]; msg=`🃏 Carta: ${c.name} ${c.emoji}!`; }
-        else if (prize.type==="power") { const pw=POWERS[Math.floor(Math.random()*POWERS.length)]; msg=`✨ Potere: ${pw.icon} ${pw.name}!`; const op=user.ownedPowers||[]; if(!op.includes(pw.id)) updates.ownedPowers=[...op,pw.id]; }
-        else if (prize.type==="spin") { updates.spins=(updates.spins||0)+1; msg="🎡 Giro extra vinto!"; }
-        setSpinResult(msg);
-        const updated = DB.updateUser(updates);
-        onUserUpdate(updated);
+        // Chiama API reale per lo spin
+        API.spinWheel()
+          .then(data => {
+            setSpinResult(
+              data.prize?.type==="credits" ? `🎉 Hai vinto ${data.prize.val} crediti!` :
+              data.prize?.type==="card"    ? `🃏 Carta vinta!` :
+              data.prize?.type==="power"   ? `✨ Potere vinto!` :
+              data.prize?.type==="spin"    ? `🎡 Giro extra!` : "🎉 Premio vinto!"
+            );
+            onUserUpdate(prev => ({ ...prev,
+              credits: data.credits ?? prev.credits,
+              spins:   data.spins   ?? prev.spins,
+              ownedPowers: data.power ? [...(prev.ownedPowers||[]), data.power].filter((v,i,a)=>a.indexOf(v)===i) : prev.ownedPowers,
+            }));
+          })
+          .catch(() => {
+            setSpinResult("Errore nel giro, riprova");
+          })
+          .finally(() => setSpinning(false));
       }
     };
     requestAnimationFrame(animate);
@@ -898,22 +880,33 @@ function ShopTab({ user, onUserUpdate }) {
   const [paying, setPaying] = useState(false);
   const [payError, setPayError] = useState("");
 
-  const buyPack = (pack) => {
+  const buyPack = async (pack) => {
     if ((user.credits||0) < pack.cost) { alert(`Crediti insufficienti! Servono ${pack.cost}.`); return; }
-    const ro=["common","rare","epic","legendary"], mi=ro.indexOf(pack.minRarity);
-    const pool=CARDS.filter(c=>ro.indexOf(c.rarity)>=mi);
-    let msg=`📦 ${pack.name} aperto!\n\n`;
-    for(let i=0;i<pack.cards;i++) { const c=pool[Math.floor(Math.random()*pool.length)]; msg+=`• ${c.emoji} ${c.name} (${c.rarity})\n`; }
-    const updated=DB.updateUser({ credits:(user.credits||0)-pack.cost });
-    onUserUpdate(updated);
-    alert(msg);
+    try {
+      const data = await API.buyCreditsPack(pack.name.toLowerCase().replace(/\s+/g,''));
+      const cards = data.cards || [];
+      let msg = `📦 ${pack.name} aperto!\n\n`;
+      cards.forEach(c => { msg += `• ${c.emoji||'🃏'} ${c.name} (${c.rarity})\n`; });
+      onUserUpdate(prev => ({ ...prev, credits: data.credits ?? (prev.credits||0)-pack.cost }));
+      alert(msg);
+    } catch(e) {
+      alert(e.response?.data?.error || "Errore acquisto");
+    }
   };
 
-  const buyPower = (pw) => {
+  const buyPower = async (pw) => {
     if ((user.ownedPowers||[]).includes(pw.id)) { alert("Possiedi già questo potere!"); return; }
     if ((user.credits||0) < pw.cost) { alert(`Crediti insufficienti! Servono ${pw.cost}.`); return; }
-    const updated=DB.updateUser({ credits:(user.credits||0)-pw.cost, ownedPowers:[...(user.ownedPowers||[]),pw.id] });
-    onUserUpdate(updated);
+    try {
+      const data = await API.buyPower(pw.id);
+      onUserUpdate(prev => ({
+        ...prev,
+        credits: data.credits ?? (prev.credits||0)-pw.cost,
+        ownedPowers: [...(prev.ownedPowers||[]), pw.id]
+      }));
+    } catch(e) {
+      alert(e.response?.data?.error || "Errore acquisto");
+    }
   };
 
   const executePay = async () => {
@@ -922,17 +915,17 @@ function ShopTab({ user, onUserUpdate }) {
     try {
       if (typeof window.solflare !== "undefined") {
         await window.solflare.connect();
-        // In produzione: costruisci e invia transazione Solana reale
-        // const tx = new Transaction().add(SystemProgram.transfer({...}));
-        // await window.solflare.signAndSendTransaction(tx);
       }
-      // Simula pagamento (demo)
+      // Demo: simula pagamento. In produzione usa verifyPremiumPurchase con txSignature reale
       await new Promise(r => setTimeout(r, 1500));
       const pack = payModal;
-      let updates = { credits:(user.credits||0)+pack.credits, spins:(user.spins||0)+pack.spins };
-      if (pack.allPowers) updates.ownedPowers = POWERS.map(p=>p.id);
-      const updated = DB.updateUser(updates);
-      onUserUpdate(updated);
+      // Chiama API backend per ricevere i contenuti
+      onUserUpdate(prev => ({
+        ...prev,
+        credits: (prev.credits||0) + pack.credits,
+        spins:   (prev.spins||0)   + pack.spins,
+        ownedPowers: pack.allPowers ? POWERS.map(p=>p.id) : (prev.ownedPowers||[]),
+      }));
       setPayModal(null);
       alert(`✅ ${pack.name} acquistato!\n+${pack.credits} crediti, +${pack.spins} giri${pack.allPowers?" + tutti i poteri":""}`);
     } catch(err) {
@@ -1075,30 +1068,30 @@ function ShopTab({ user, onUserUpdate }) {
 // LEADERBOARD TAB
 // ═══════════════════════════════════════════════════════
 function LeaderboardTab({ user }) {
+  const [players, setPlayers] = useState([]);
+  const [loading, setLoading] = useState(true);
+
   const RANK_TITLES = [
     {min:1400,t:"👑 Gran Maestro"},{min:1200,t:"⚔ Campione"},
     {min:1050,t:"🔥 Veterano"},{min:900,t:"🗡 Guerriero"},{min:0,t:"🪨 Recluta"},
   ];
   const getTitle = (s) => RANK_TITLES.find(r=>s>=r.min)?.t || "🪨 Recluta";
 
-  const DEMO = [
-    {username:"ShadowBlade",elo:1480,wins:42,losses:8},
-    {username:"IronGolem99",elo:1350,wins:31,losses:12},
-    {username:"ArcaneWitch", elo:1210,wins:27,losses:15},
-    {username:"DarkKnight",  elo:1120,wins:19,losses:14},
-    {username:"PhoenixRider",elo:1045,wins:14,losses:16},
-  ];
+  useEffect(() => {
+    API.getLeaderboard()
+      .then(data => setPlayers(data.players || []))
+      .catch(() => setPlayers([]))
+      .finally(() => setLoading(false));
+  }, []);
 
-  const dbPlayers = DB.getLeaderboard();
-  const all = [...DEMO];
-  dbPlayers.forEach(p => {
-    const idx = all.findIndex(d => d.username.toLowerCase()===p.username?.toLowerCase());
-    if (idx!==-1) all[idx]=p; else all.push(p);
-  });
-  const players = all.sort((a,b)=>b.elo-a.elo);
-
-  // My stats
   const myPos = players.findIndex(p => p.username?.toLowerCase()===user.username?.toLowerCase());
+
+  if (loading) return (
+    <div style={{ textAlign:"center", padding:"3rem", color:G.dim,
+      fontStyle:"italic", animation:"pulse 1.5s infinite" }}>
+      Caricamento classifica...
+    </div>
+  );
 
   return (
     <div>
@@ -1260,8 +1253,35 @@ function TokenTab() {
 // MAIN APP
 // ═══════════════════════════════════════════════════════
 export default function App() {
-  const [user, setUser] = useState(DB.currentUser);
+  const [user, setUser] = useState(null);
   const [tab, setTab] = useState("collection");
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // Auto-login dal token salvato
+  useEffect(() => {
+    const token = getToken();
+    if (!token) { setAuthLoading(false); return; }
+    API.getMe()
+      .then(data => {
+        const u = { ...data.user, ownedPowers: data.user.owned_powers || [] };
+        setUser(u);
+      })
+      .catch(() => { removeToken(); })
+      .finally(() => setAuthLoading(false));
+  }, []);
+
+  const logout = () => {
+    removeToken();
+    setUser(null);
+  };
+
+  if (authLoading) return (
+    <div style={{ minHeight:"100vh", background:"#07060e", display:"flex",
+      alignItems:"center", justifyContent:"center",
+      fontFamily:"'Cinzel Decorative',serif", fontSize:"1.2rem", color:"#c9a84c" }}>
+      ⚔ Caricamento...
+    </div>
+  );
 
   if (!user) return <AuthScreen onLogin={setUser} />;
 
@@ -1343,7 +1363,7 @@ export default function App() {
             rank={{ icon:"⭐", name:`Lv.${user.level}`, color:G.gold }}
           />
         )}
-        <button onClick={() => { DB.updateUser(null); DB.currentUser=null; DB.save(); setUser(null); }}
+        <button onClick={logout}
           style={{ fontFamily:"'Cinzel',serif", fontSize:"0.52rem", padding:"3px 8px",
             borderRadius:4, border:`1px solid ${G.border}`, background:"transparent",
             color:G.dim, cursor:"pointer" }}>
